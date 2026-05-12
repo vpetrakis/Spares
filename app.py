@@ -6,8 +6,17 @@ Entry point for Streamlit.  This file is pure orchestration:
   load → parse → compute metrics → render UI.
 No business logic or data manipulation lives here.
 """
+import os
+import sys
 import io
 import traceback
+
+# ── Ensure the repo root is on sys.path so that `core` and `ui`
+#    are importable both locally and on Streamlit Community Cloud
+#    (which runs from /mount/src/<repo_name>/)
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import pandas as pd
 import streamlit as st

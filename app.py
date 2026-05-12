@@ -1,27 +1,32 @@
 """
 app.py — Marine Spares Control Tower
 M/V ALEXIS 2026
-
-Entry point for Streamlit.  This file is pure orchestration:
-  load → parse → compute metrics → render UI.
-No business logic or data manipulation lives here.
 """
 import os
 import sys
 import io
 import traceback
 
-# ── Ensure the repo root is on sys.path so that `core` and `ui`
-#    are importable both locally and on Streamlit Community Cloud
-#    (which runs from /mount/src/<repo_name>/)
-_ROOT = os.path.dirname(os.path.abspath(__file__))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+# ── Bulletproof sys.path for Streamlit Cloud + local dev
+# Strategy: try __file__, fall back to cwd, then also try /mount/src/* pattern
+try:
+    _ROOT = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _ROOT = os.path.abspath(os.getcwd())
+
+for _candidate in [_ROOT] + [
+    p for p in [
+        os.path.join(_ROOT, ".."),
+        "/mount/src/spares",
+    ] if os.path.isdir(os.path.join(p, "core"))
+]:
+    _candidate = os.path.abspath(_candidate)
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
 
 import pandas as pd
 import streamlit as st
 
-# ── Project imports ───────────────────────────
 from core import (
     parse_workbook,
     pipeline_summary,
@@ -58,13 +63,8 @@ st.set_page_config(
 inject_css()
 
 
-# ──────────────────────────────────────────────
-# SESSION-STATE CACHED PARSER
-# ──────────────────────────────────────────────
-
 @st.cache_data(show_spinner=False)
 def load_data(file_bytes: bytes):
-    """Parse workbook once; cache result for the session."""
     return parse_workbook(file_bytes)
 
 
@@ -76,13 +76,11 @@ with st.sidebar:
     st.markdown("### 🚢 Control Tower")
     st.markdown("**M/V ALEXIS — 2026 Spares**")
     st.markdown("---")
-
     uploaded = st.file_uploader(
         "Upload master spares file",
         type=["xlsx"],
         help="Drop the ALEXIS_-_2026.xlsx (or any year equivalent) here.",
     )
-
     st.markdown("---")
     st.markdown(
         "<small style='color:#8B949E'>Pipeline SLA thresholds<br>"
@@ -90,11 +88,6 @@ with st.sidebar:
         "Ordered: 45 days · Transit: 21 days</small>",
         unsafe_allow_html=True,
     )
-
-
-# ──────────────────────────────────────────────
-# MAIN — LANDING / WAITING STATE
-# ──────────────────────────────────────────────
 
 if not uploaded:
     st.markdown(
@@ -111,11 +104,6 @@ if not uploaded:
     )
     st.stop()
 
-
-# ──────────────────────────────────────────────
-# PARSE
-# ──────────────────────────────────────────────
-
 try:
     with st.spinner("Parsing workbook…"):
         df, index_kpis, warnings = load_data(uploaded.getvalue())
@@ -125,34 +113,23 @@ except Exception as exc:
         st.code(traceback.format_exc())
     st.stop()
 
-
 # ──────────────────────────────────────────────
-# SIDEBAR FILTERS (built after data is loaded)
+# SIDEBAR FILTERS
 # ──────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("---")
     st.markdown("#### Filters")
-
     status_options = sorted(df["status_label"].dropna().unique().tolist())
     sel_status = st.multiselect("Status", status_options, default=status_options)
-
     equip_options = sorted(df["equipment"].dropna().replace("", pd.NA).dropna().unique().tolist())
     sel_equip = st.multiselect("Equipment", equip_options, default=[])
-
     cat_options = sorted(df["category_name"].dropna().replace("", pd.NA).dropna().unique().tolist())
     sel_cat = st.multiselect("Category", cat_options, default=[])
-
     supplier_options = sorted(df["supplier"].dropna().replace("", pd.NA).dropna().unique().tolist())
     sel_supplier = st.multiselect("Supplier", supplier_options, default=[])
 
-
-# ──────────────────────────────────────────────
-# APPLY FILTERS
-# ──────────────────────────────────────────────
-
 filtered = df.copy()
-
 if sel_status:
     filtered = filtered[filtered["status_label"].isin(sel_status)]
 if sel_equip:
@@ -162,11 +139,6 @@ if sel_cat:
 if sel_supplier:
     filtered = filtered[filtered["supplier"].isin(sel_supplier)]
 
-
-# ──────────────────────────────────────────────
-# COMPUTE METRICS (on filtered data)
-# ──────────────────────────────────────────────
-
 summary    = pipeline_summary(filtered)
 status_df  = status_distribution(filtered)
 cat_df     = category_breakdown(filtered)
@@ -174,9 +146,8 @@ sup_df     = supplier_performance(filtered)
 time_df    = timeline_data(filtered)
 delayed_df = delayed_items(filtered)
 
-
 # ──────────────────────────────────────────────
-# PAGE HEADER
+# HEADER
 # ──────────────────────────────────────────────
 
 col_title, col_meta = st.columns([3, 1])
@@ -190,49 +161,29 @@ with col_meta:
             unsafe_allow_html=True,
         )
 
-# Data quality notices
 warnings_banner(warnings)
-
-# KPI row
 kpi_row(summary)
-
 
 # ──────────────────────────────────────────────
 # TABS
 # ──────────────────────────────────────────────
 
 tab_overview, tab_triage, tab_fleet, tab_suppliers, tab_categories = st.tabs([
-    "📊 Overview",
-    "🔥 Triage",
-    "🔍 Full Fleet",
-    "🏭 Suppliers",
-    "📦 Categories",
+    "📊 Overview", "🔥 Triage", "🔍 Full Fleet", "🏭 Suppliers", "📦 Categories",
 ])
 
-
-# ── OVERVIEW ──────────────────────────────────
 with tab_overview:
     col_l, col_r = st.columns([2, 1])
-
     with col_l:
         section("Pipeline Status Distribution")
         st.plotly_chart(status_bar(status_df), use_container_width=True, config={"displayModeBar": False})
-
         section("Requisition Volume Timeline")
         st.plotly_chart(timeline_chart(time_df), use_container_width=True, config={"displayModeBar": False})
-
     with col_r:
         section("SLA Health")
-        st.plotly_chart(
-            sla_gauge(summary["delayed"], summary["total"]),
-            use_container_width=True,
-            config={"displayModeBar": False},
-        )
-
+        st.plotly_chart(sla_gauge(summary["delayed"], summary["total"]), use_container_width=True, config={"displayModeBar": False})
         section("Spend by Category")
         st.plotly_chart(category_treemap(cat_df), use_container_width=True, config={"displayModeBar": False})
-
-    # INDEX sheet KPIs
     if index_kpis:
         section("Category Ledger (from INDEX sheet)")
         idx_rows = []
@@ -247,40 +198,29 @@ with tab_overview:
             })
         st.dataframe(pd.DataFrame(idx_rows), use_container_width=True, hide_index=True)
 
-
-# ── TRIAGE ────────────────────────────────────
 with tab_triage:
     if summary["delayed"] == 0:
         st.success("✅ All active requisitions are within SLA. Fleet supply chain is healthy.")
     else:
         st.error(f"⚠️ **{summary['delayed']} requisition(s) have breached SLA thresholds.** Immediate action required.")
-
     section(f"SLA Breach Triage — {summary['delayed']} item(s)")
     triage_table(delayed_df)
-
-    # Cancelled items (informational, not errors)
     cancelled_df = filtered[filtered["status"] == "CANCELLED"]
     if not cancelled_df.empty:
         section(f"Cancelled Requisitions — {len(cancelled_df)} item(s)")
         with st.expander("Show cancelled items"):
-            view_cols = ["ta_ref", "description", "equipment", "supplier", "confirmation", "cost"]
-            view_cols = [c for c in view_cols if c in cancelled_df.columns]
+            view_cols = [c for c in ["ta_ref", "description", "equipment", "supplier", "confirmation", "cost"] if c in cancelled_df.columns]
             st.dataframe(
                 cancelled_df[view_cols].rename(columns={
                     "ta_ref": "TA Ref", "description": "Description",
                     "equipment": "Equipment", "supplier": "Supplier",
                     "confirmation": "Cancellation Note", "cost": "Cost ($)",
                 }),
-                use_container_width=True,
-                hide_index=True,
+                use_container_width=True, hide_index=True,
             )
 
-
-# ── FULL FLEET ────────────────────────────────
 with tab_fleet:
     section(f"All Requisitions — {len(filtered)} records")
-
-    # Sub-orders expander
     has_suborders = filtered["sub_orders"].apply(lambda x: len(x) > 0 if isinstance(x, list) else False).any()
     if has_suborders:
         with st.expander("🔗 Split orders (multi-supplier requisitions)"):
@@ -293,10 +233,7 @@ with tab_fleet:
                         f"Cost: ${sub.get('cost', 0):,.2f}",
                         unsafe_allow_html=True,
                     )
-
     fleet_table(filtered)
-
-    # CSV export
     csv_cols = [c for c in filtered.columns if c not in ("sub_orders",)]
     csv_data = filtered[csv_cols].copy()
     for dc in ["date_requested", "order_date", "est_readiness", "rcvd", "ref_date", "invoice"]:
@@ -309,11 +246,8 @@ with tab_fleet:
         mime="text/csv",
     )
 
-
-# ── SUPPLIERS ─────────────────────────────────
 with tab_suppliers:
     section("Supplier Intelligence")
-
     if sup_df.empty:
         st.info("No supplier data available for current filter selection.")
     else:
@@ -324,11 +258,8 @@ with tab_suppliers:
             section("Supplier Scorecard")
             supplier_table(sup_df)
 
-
-# ── CATEGORIES ────────────────────────────────
 with tab_categories:
     section("Category Breakdown")
-
     col_tree, col_tbl = st.columns([2, 1])
     with col_tree:
         st.plotly_chart(category_treemap(cat_df), use_container_width=True, config={"displayModeBar": False})
@@ -337,8 +268,6 @@ with tab_categories:
         view["total_cost"] = view["total_cost"].apply(lambda x: f"${x:,.2f}")
         view.columns = ["Category", "Count", "Total Cost", "Delayed"]
         st.dataframe(view, use_container_width=True, hide_index=True)
-
-    # Category-level drill-down
     section("Drill-down by category")
     all_cats = sorted(filtered["category_name"].dropna().replace("", pd.NA).dropna().unique().tolist())
     if all_cats:
@@ -347,11 +276,6 @@ with tab_categories:
         fleet_table(cat_view)
     else:
         st.info("No categorised requisitions in current selection.")
-
-
-# ──────────────────────────────────────────────
-# FOOTER
-# ──────────────────────────────────────────────
 
 st.markdown(
     "<div style='text-align:center;color:#30363D;font-size:.72rem;padding:32px 0 8px'>"

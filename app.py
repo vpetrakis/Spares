@@ -176,14 +176,14 @@ with tab_overview:
     col_l, col_r = st.columns([2, 1])
     with col_l:
         section("Pipeline Status Distribution")
-        st.plotly_chart(status_bar(status_df), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(status_bar(status_df), use_container_width=True, config={"displayModeBar": False}, key="chart_status_bar")
         section("Requisition Volume Timeline")
-        st.plotly_chart(timeline_chart(time_df), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(timeline_chart(time_df), use_container_width=True, config={"displayModeBar": False}, key="chart_timeline")
     with col_r:
         section("SLA Health")
-        st.plotly_chart(sla_gauge(summary["delayed"], summary["total"]), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(sla_gauge(summary["delayed"], summary["total"]), use_container_width=True, config={"displayModeBar": False}, key="chart_sla_gauge")
         section("Spend by Category")
-        st.plotly_chart(category_treemap(cat_df), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(category_treemap(cat_df), use_container_width=True, config={"displayModeBar": False}, key="chart_treemap_overview")
     if index_kpis:
         section("Category Ledger (from INDEX sheet)")
         idx_rows = []
@@ -253,7 +253,7 @@ with tab_suppliers:
     else:
         col_chart, col_table = st.columns([2, 1])
         with col_chart:
-            st.plotly_chart(supplier_bar(sup_df), use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(supplier_bar(sup_df), use_container_width=True, config={"displayModeBar": False}, key="chart_supplier_bar")
         with col_table:
             section("Supplier Scorecard")
             supplier_table(sup_df)
@@ -262,7 +262,7 @@ with tab_categories:
     section("Category Breakdown")
     col_tree, col_tbl = st.columns([2, 1])
     with col_tree:
-        st.plotly_chart(category_treemap(cat_df), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(category_treemap(cat_df), use_container_width=True, config={"displayModeBar": False}, key="chart_treemap_categories")
     with col_tbl:
         view = cat_df.copy()
         view["total_cost"] = view["total_cost"].apply(lambda x: f"${x:,.2f}")

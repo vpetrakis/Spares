@@ -1,189 +1,352 @@
-import streamlit as st
+"""
+app.py — Marine Spares Control Tower
+M/V ALEXIS 2026
+
+Entry point for Streamlit.  This file is pure orchestration:
+  load → parse → compute metrics → render UI.
+No business logic or data manipulation lives here.
+"""
+import io
+import traceback
+
 import pandas as pd
-import openpyxl
-import urllib.parse
-from datetime import datetime
+import streamlit as st
 
-# ==========================================
-# 1. PAGE CONFIG & PREMIUM UI INJECTIONS
-# ==========================================
-st.set_page_config(page_title="Marine Spares Control Tower", page_icon="🚢", layout="wide")
+# ── Project imports ───────────────────────────
+from core import (
+    parse_workbook,
+    pipeline_summary,
+    status_distribution,
+    category_breakdown,
+    supplier_performance,
+    timeline_data,
+    delayed_items,
+)
+from ui import (
+    inject_css,
+    kpi_row,
+    section,
+    warnings_banner,
+    triage_table,
+    fleet_table,
+    supplier_table,
+    status_bar,
+    category_treemap,
+    timeline_chart,
+    supplier_bar,
+    sla_gauge,
+)
 
-st.markdown("""
-    <style>
-    .stApp { background-color: #0E1117; color: #FAFAFA; font-family: 'Inter', sans-serif; }
-    .metric-critical {
-        background: linear-gradient(135deg, #2b0000 0%, #4a0000 100%);
-        border: 1px solid #ff4b4b;
-        border-radius: 8px;
-        padding: 20px;
-        text-align: center;
-        animation: pulse 2s infinite;
-    }
-    .metric-card {
-        background: #1E2329;
-        border: 1px solid #2B303A;
-        border-radius: 8px;
-        padding: 20px;
-        text-align: center;
-        transition: transform 0.2s ease-in-out;
-    }
-    .metric-card:hover { transform: translateY(-5px); box-shadow: 0 5px 15px rgba(0,0,0,0.3); }
-    @keyframes pulse {
-        0% { box-shadow: 0 0 10px rgba(255, 75, 75, 0.4); }
-        50% { box-shadow: 0 0 20px rgba(255, 75, 75, 0.8); }
-        100% { box-shadow: 0 0 10px rgba(255, 75, 75, 0.4); }
-    }
-    </style>
-""", unsafe_allow_html=True)
+# ──────────────────────────────────────────────
+# PAGE CONFIG
+# ──────────────────────────────────────────────
+st.set_page_config(
+    page_title="Marine Spares Control Tower — M/V Alexis",
+    page_icon="🚢",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+inject_css()
 
-# ==========================================
-# 2. BULLETPROOF DATA EXTRACTION ENGINE
-# ==========================================
+
+# ──────────────────────────────────────────────
+# SESSION-STATE CACHED PARSER
+# ──────────────────────────────────────────────
+
 @st.cache_data(show_spinner=False)
-def extract_and_clean_data(file_bytes):
-    try:
-        import io
-        file_obj = io.BytesIO(file_bytes)
-        wb = openpyxl.load_workbook(file_obj, data_only=True)
-        sheet_name = next((s for s in wb.sheetnames if 'SPARES' in s.upper()), wb.sheetnames[0])
-        ws = wb[sheet_name]
-        
-        header_row_idx = next((i + 1 for i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True)) if row and "TA REF" in row), None)
-        if not header_row_idx: return pd.DataFrame(), "CRITICAL ERROR: Header row not found."
+def load_data(file_bytes: bytes):
+    """Parse workbook once; cache result for the session."""
+    return parse_workbook(file_bytes)
 
-        headers = [str(cell.value).strip() if cell.value else f"Col_{idx}" for idx, cell in enumerate(ws[header_row_idx])]
-        data = []
-        base_path = r"Z:\Marine_Dept\Alexis\Spares\Hyperlinks 2026"
-        
-        for row in ws.iter_rows(min_row=header_row_idx + 1):
-            row_data = {}
-            if not row[headers.index('TA REF') if 'TA REF' in headers else 1].value: continue
-                
-            for idx, cell in enumerate(row):
-                if idx < len(headers):
-                    col_name = headers[idx]
-                    row_data[col_name] = cell.value
-                    
-                    if cell.hyperlink and cell.hyperlink.target:
-                        raw_link = urllib.parse.unquote(str(cell.hyperlink.target))
-                        if raw_link.startswith("..\\..\\") and "MODION" in raw_link:
-                            tail = raw_link.split("MODION")[1].replace("\\", "/")
-                            row_data[f"{col_name}_URL"] = f"file:///{base_path.replace(chr(92), '/')}/MODION{tail}"
-                        else:
-                            row_data[f"{col_name}_URL"] = raw_link
-            data.append(row_data)
-            
-        df = pd.DataFrame(data)
-        if 'SENT TO FINANCE' not in df.columns: df['SENT TO FINANCE'] = pd.NaT
-        if 'PRIORITY' not in df.columns: df['PRIORITY'] = "STANDARD"
-        return df, None
-    except Exception as e:
-        return pd.DataFrame(), str(e)
 
-# ==========================================
-# 3. STATE MACHINE & SLA CALCULATOR
-# ==========================================
-def process_pipeline_state(df):
-    today = pd.to_datetime('today')
-    date_cols = ['DATE', 'SENT TO FINANCE', 'ORDER DATE', 'EST. READINESS', 'RCVD']
-    for col in date_cols: df[col] = pd.to_datetime(df[col], errors='coerce')
-        
-    SLA_SUPPLY = 7
-    SLA_FINANCE = 5
-    
-    statuses, flags = [], []
-    for _, row in df.iterrows():
-        is_critical = str(row.get('PRIORITY')).upper().strip() == 'CRITICAL'
-        
-        if pd.notnull(row['RCVD']):
-            state, flag = "🟢 Completed", "OK"
-        elif pd.notnull(row['EST. READINESS']):
-            state, flag = ("🔴 Logistics Lag (Overdue)", "DELAYED") if row['EST. READINESS'] < today else ("🟡 In Transit", "OK")
-        elif pd.notnull(row['ORDER DATE']):
-            state, flag = "🟠 Ordered (Awaiting Delivery Date)", "OK"
-        elif pd.notnull(row['SENT TO FINANCE']):
-            state, flag = ("🔴 Finance Lag (Overdue)", "DELAYED") if (today - row['SENT TO FINANCE']).days > SLA_FINANCE else ("🟣 Pending Finance", "OK")
-        elif pd.notnull(row['DATE']):
-            state, flag = ("🔴 Supply Lag (Overdue)", "DELAYED") if (today - row['DATE']).days > SLA_SUPPLY else ("🔵 Pending Supply", "OK")
-        else:
-            state, flag = "⚪ Unknown", "ERROR"
-            
-        if is_critical and flag == "DELAYED": state = "🔥 CRITICAL FAILURE: " + state
-        statuses.append(state); flags.append(flag)
-        
-    df['STATUS'] = statuses; df['FLAG'] = flags
-    cols = df.columns.tolist()
-    for c in reversed([c for c in ['PRIORITY', 'STATUS', 'TA REF'] if c in cols]): cols.insert(0, cols.pop(cols.index(c)))
-    return df
+# ──────────────────────────────────────────────
+# SIDEBAR
+# ──────────────────────────────────────────────
 
-# ==========================================
-# 4. FRONTEND DASHBOARD RENDERING
-# ==========================================
-st.title("🚢 Marine Spares Control Tower")
+with st.sidebar:
+    st.markdown("### 🚢 Control Tower")
+    st.markdown("**M/V ALEXIS — 2026 Spares**")
+    st.markdown("---")
 
-uploaded_file = st.file_uploader("Drop Master Spares File (.xlsx) Here", type=["xlsx"])
+    uploaded = st.file_uploader(
+        "Upload master spares file",
+        type=["xlsx"],
+        help="Drop the ALEXIS_-_2026.xlsx (or any year equivalent) here.",
+    )
 
-if uploaded_file:
-    with st.spinner("Executing Data Extraction & Path Resolution..."):
-        raw_df, error = extract_and_clean_data(uploaded_file.getvalue())
-        
-    if error: st.error(f"System Integrity Fault: {error}")
-    elif not raw_df.empty:
-        df = process_pipeline_state(raw_df)
-        
-        # --- METRICS ---
-        st.markdown("<br>", unsafe_allow_html=True)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.markdown(f"<div class='metric-card'><h3>{len(df)}</h3><p>Total Pipeline Requisitions</p></div>", unsafe_allow_html=True)
-        c2.markdown(f"<div class='metric-card'><h3>{len(df[df['STATUS'] == '🟢 Completed'])}</h3><p>Completed / Onboard</p></div>", unsafe_allow_html=True)
-        c3.markdown(f"<div class='metric-card'><h3>{len(df[df['FLAG'] == 'DELAYED']) - len(df[df['STATUS'].str.contains('CRITICAL FAILURE')])}</h3><p>Standard Delays</p></div>", unsafe_allow_html=True)
-        
-        crit_alerts = len(df[df['STATUS'].str.contains("CRITICAL FAILURE")])
-        if crit_alerts > 0: c4.markdown(f"<div class='metric-critical'><h3 style='color:white;'>{crit_alerts}</h3><p style='color:white; font-weight:bold;'>CRITICAL OVERDUE</p></div>", unsafe_allow_html=True)
-        else: c4.markdown(f"<div class='metric-card'><h3>0</h3><p>Critical Overdue</p></div>", unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown(
+        "<small style='color:#8B949E'>Pipeline SLA thresholds<br>"
+        "Supply: 7 days · Finance: 5 days<br>"
+        "Ordered: 45 days · Transit: 21 days</small>",
+        unsafe_allow_html=True,
+    )
 
-        st.markdown("<hr style='border:1px solid #2B303A'>", unsafe_allow_html=True)
-        
-        # --- NATIVE STREAMLIT BOTTLENECK ANALYSIS (No Plotly Required) ---
-        st.subheader("📊 Pipeline Bottleneck Analysis")
-        active_df = df[df['STATUS'] != '🟢 Completed']
-        
-        if not active_df.empty:
-            col_chart, col_triage = st.columns([1.5, 2])
-            with col_chart:
-                status_counts = active_df['STATUS'].value_counts()
-                st.bar_chart(status_counts) # Native Streamlit Chart
-                
-            with col_triage:
-                st.markdown("### 🔥 Priority Triage Zone")
-                critical_df = df[df['STATUS'].str.contains("CRITICAL FAILURE")]
-                if not critical_df.empty:
-                    st.error("Immediate Action Required on the following items:")
-                    display_cols = [c for c in ['TA REF', 'EQUIPMENT', 'STATUS', 'DATE', 'SENT TO FINANCE'] if c in critical_df.columns]
-                    st.dataframe(critical_df[display_cols], hide_index=True, use_container_width=True)
-                else:
-                    st.success("No critical overdue items. Fleet equipment is secure.")
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # --- INTERACTIVE DATA GRID ---
-        st.subheader("🔍 Full Fleet Control Grid")
-        f_col1, f_col2, f_col3 = st.columns(3)
-        with f_col1: stat_filt = st.multiselect("Filter Status:", options=df['STATUS'].unique(), default=df['STATUS'].unique())
-        with f_col2: equip_filt = st.multiselect("Filter Equipment:", options=df['EQUIPMENT'].dropna().unique())
-        with f_col3: pri_filt = st.multiselect("Priority:", options=df['PRIORITY'].unique(), default=df['PRIORITY'].unique())
-            
-        filtered = df[df['STATUS'].isin(stat_filt) & df['PRIORITY'].isin(pri_filt)]
-        if equip_filt: filtered = filtered[filtered['EQUIPMENT'].isin(equip_filt)]
-            
-        st.dataframe(
-            filtered, use_container_width=True, hide_index=True,
-            column_config={
-                "TA REF_URL": st.column_config.LinkColumn("Document Link", display_text="Open File"),
-                "COST": st.column_config.NumberColumn("Cost ($)", format="$%.2f"),
-                "DATE": st.column_config.DateColumn("Requested", format="DD MMM YYYY"),
-                "SENT TO FINANCE": st.column_config.DateColumn("To Finance", format="DD MMM YYYY"),
-                "ORDER DATE": st.column_config.DateColumn("PO Placed", format="DD MMM YYYY")
-            }
+
+# ──────────────────────────────────────────────
+# MAIN — LANDING / WAITING STATE
+# ──────────────────────────────────────────────
+
+if not uploaded:
+    st.markdown(
+        """
+        <div style='text-align:center;padding:80px 0 40px'>
+          <div style='font-size:4rem'>🚢</div>
+          <h2 style='color:#E6EDF3;margin:16px 0 8px'>Marine Spares Control Tower</h2>
+          <p style='color:#8B949E;font-size:1rem'>
+            Upload the master spares Excel file using the sidebar to begin.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+
+# ──────────────────────────────────────────────
+# PARSE
+# ──────────────────────────────────────────────
+
+try:
+    with st.spinner("Parsing workbook…"):
+        df, index_kpis, warnings = load_data(uploaded.getvalue())
+except Exception as exc:
+    st.error(f"**Parse error:** {exc}")
+    with st.expander("Full traceback"):
+        st.code(traceback.format_exc())
+    st.stop()
+
+
+# ──────────────────────────────────────────────
+# SIDEBAR FILTERS (built after data is loaded)
+# ──────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("#### Filters")
+
+    status_options = sorted(df["status_label"].dropna().unique().tolist())
+    sel_status = st.multiselect("Status", status_options, default=status_options)
+
+    equip_options = sorted(df["equipment"].dropna().replace("", pd.NA).dropna().unique().tolist())
+    sel_equip = st.multiselect("Equipment", equip_options, default=[])
+
+    cat_options = sorted(df["category_name"].dropna().replace("", pd.NA).dropna().unique().tolist())
+    sel_cat = st.multiselect("Category", cat_options, default=[])
+
+    supplier_options = sorted(df["supplier"].dropna().replace("", pd.NA).dropna().unique().tolist())
+    sel_supplier = st.multiselect("Supplier", supplier_options, default=[])
+
+
+# ──────────────────────────────────────────────
+# APPLY FILTERS
+# ──────────────────────────────────────────────
+
+filtered = df.copy()
+
+if sel_status:
+    filtered = filtered[filtered["status_label"].isin(sel_status)]
+if sel_equip:
+    filtered = filtered[filtered["equipment"].isin(sel_equip)]
+if sel_cat:
+    filtered = filtered[filtered["category_name"].isin(sel_cat)]
+if sel_supplier:
+    filtered = filtered[filtered["supplier"].isin(sel_supplier)]
+
+
+# ──────────────────────────────────────────────
+# COMPUTE METRICS (on filtered data)
+# ──────────────────────────────────────────────
+
+summary    = pipeline_summary(filtered)
+status_df  = status_distribution(filtered)
+cat_df     = category_breakdown(filtered)
+sup_df     = supplier_performance(filtered)
+time_df    = timeline_data(filtered)
+delayed_df = delayed_items(filtered)
+
+
+# ──────────────────────────────────────────────
+# PAGE HEADER
+# ──────────────────────────────────────────────
+
+col_title, col_meta = st.columns([3, 1])
+with col_title:
+    st.markdown("## 🚢 Marine Spares Control Tower — M/V ALEXIS 2026")
+with col_meta:
+    if len(filtered) < len(df):
+        st.markdown(
+            f"<div style='text-align:right;padding-top:12px;color:#E3B341;font-size:.82rem'>"
+            f"⚡ Showing {len(filtered)} of {len(df)} requisitions</div>",
+            unsafe_allow_html=True,
         )
+
+# Data quality notices
+warnings_banner(warnings)
+
+# KPI row
+kpi_row(summary)
+
+
+# ──────────────────────────────────────────────
+# TABS
+# ──────────────────────────────────────────────
+
+tab_overview, tab_triage, tab_fleet, tab_suppliers, tab_categories = st.tabs([
+    "📊 Overview",
+    "🔥 Triage",
+    "🔍 Full Fleet",
+    "🏭 Suppliers",
+    "📦 Categories",
+])
+
+
+# ── OVERVIEW ──────────────────────────────────
+with tab_overview:
+    col_l, col_r = st.columns([2, 1])
+
+    with col_l:
+        section("Pipeline Status Distribution")
+        st.plotly_chart(status_bar(status_df), use_container_width=True, config={"displayModeBar": False})
+
+        section("Requisition Volume Timeline")
+        st.plotly_chart(timeline_chart(time_df), use_container_width=True, config={"displayModeBar": False})
+
+    with col_r:
+        section("SLA Health")
+        st.plotly_chart(
+            sla_gauge(summary["delayed"], summary["total"]),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+
+        section("Spend by Category")
+        st.plotly_chart(category_treemap(cat_df), use_container_width=True, config={"displayModeBar": False})
+
+    # INDEX sheet KPIs
+    if index_kpis:
+        section("Category Ledger (from INDEX sheet)")
+        idx_rows = []
+        for code, kpi in index_kpis.items():
+            idx_rows.append({
+                "Code": code,
+                "Category": kpi["category_name"],
+                "Case": kpi["case_code"],
+                "Cost (Index)": f"${kpi['cost']:,.2f}" if kpi["cost"] else "—",
+                "Req. Received": kpi["requisitions_received"] or "—",
+                "Req. Processed": kpi["requisitions_processed"] or "—",
+            })
+        st.dataframe(pd.DataFrame(idx_rows), use_container_width=True, hide_index=True)
+
+
+# ── TRIAGE ────────────────────────────────────
+with tab_triage:
+    if summary["delayed"] == 0:
+        st.success("✅ All active requisitions are within SLA. Fleet supply chain is healthy.")
+    else:
+        st.error(f"⚠️ **{summary['delayed']} requisition(s) have breached SLA thresholds.** Immediate action required.")
+
+    section(f"SLA Breach Triage — {summary['delayed']} item(s)")
+    triage_table(delayed_df)
+
+    # Cancelled items (informational, not errors)
+    cancelled_df = filtered[filtered["status"] == "CANCELLED"]
+    if not cancelled_df.empty:
+        section(f"Cancelled Requisitions — {len(cancelled_df)} item(s)")
+        with st.expander("Show cancelled items"):
+            view_cols = ["ta_ref", "description", "equipment", "supplier", "confirmation", "cost"]
+            view_cols = [c for c in view_cols if c in cancelled_df.columns]
+            st.dataframe(
+                cancelled_df[view_cols].rename(columns={
+                    "ta_ref": "TA Ref", "description": "Description",
+                    "equipment": "Equipment", "supplier": "Supplier",
+                    "confirmation": "Cancellation Note", "cost": "Cost ($)",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+# ── FULL FLEET ────────────────────────────────
+with tab_fleet:
+    section(f"All Requisitions — {len(filtered)} records")
+
+    # Sub-orders expander
+    has_suborders = filtered["sub_orders"].apply(lambda x: len(x) > 0 if isinstance(x, list) else False).any()
+    if has_suborders:
+        with st.expander("🔗 Split orders (multi-supplier requisitions)"):
+            for _, row in filtered[filtered["sub_orders"].apply(lambda x: len(x) > 0 if isinstance(x, list) else False)].iterrows():
+                st.markdown(f"**{row['ta_ref']}** — {row['description']}")
+                for sub in row["sub_orders"]:
+                    st.markdown(
+                        f"&nbsp;&nbsp;&nbsp;└ Supplier: **{sub.get('supplier', '—')}** | "
+                        f"PO: {pd.Timestamp(sub['order_date']).strftime('%d %b %Y') if sub.get('order_date') else '—'} | "
+                        f"Cost: ${sub.get('cost', 0):,.2f}",
+                        unsafe_allow_html=True,
+                    )
+
+    fleet_table(filtered)
+
+    # CSV export
+    csv_cols = [c for c in filtered.columns if c not in ("sub_orders",)]
+    csv_data = filtered[csv_cols].copy()
+    for dc in ["date_requested", "order_date", "est_readiness", "rcvd", "ref_date", "invoice"]:
+        if dc in csv_data.columns:
+            csv_data[dc] = pd.to_datetime(csv_data[dc], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    st.download_button(
+        "⬇ Export filtered data as CSV",
+        csv_data.to_csv(index=False).encode("utf-8"),
+        file_name="alexis_spares_export.csv",
+        mime="text/csv",
+    )
+
+
+# ── SUPPLIERS ─────────────────────────────────
+with tab_suppliers:
+    section("Supplier Intelligence")
+
+    if sup_df.empty:
+        st.info("No supplier data available for current filter selection.")
+    else:
+        col_chart, col_table = st.columns([2, 1])
+        with col_chart:
+            st.plotly_chart(supplier_bar(sup_df), use_container_width=True, config={"displayModeBar": False})
+        with col_table:
+            section("Supplier Scorecard")
+            supplier_table(sup_df)
+
+
+# ── CATEGORIES ────────────────────────────────
+with tab_categories:
+    section("Category Breakdown")
+
+    col_tree, col_tbl = st.columns([2, 1])
+    with col_tree:
+        st.plotly_chart(category_treemap(cat_df), use_container_width=True, config={"displayModeBar": False})
+    with col_tbl:
+        view = cat_df.copy()
+        view["total_cost"] = view["total_cost"].apply(lambda x: f"${x:,.2f}")
+        view.columns = ["Category", "Count", "Total Cost", "Delayed"]
+        st.dataframe(view, use_container_width=True, hide_index=True)
+
+    # Category-level drill-down
+    section("Drill-down by category")
+    all_cats = sorted(filtered["category_name"].dropna().replace("", pd.NA).dropna().unique().tolist())
+    if all_cats:
+        chosen = st.selectbox("Select category to inspect", all_cats)
+        cat_view = filtered[filtered["category_name"] == chosen]
+        fleet_table(cat_view)
+    else:
+        st.info("No categorised requisitions in current selection.")
+
+
+# ──────────────────────────────────────────────
+# FOOTER
+# ──────────────────────────────────────────────
+
+st.markdown(
+    "<div style='text-align:center;color:#30363D;font-size:.72rem;padding:32px 0 8px'>"
+    "Marine Spares Control Tower · M/V Alexis 2026 · Built with Streamlit"
+    "</div>",
+    unsafe_allow_html=True,
+)

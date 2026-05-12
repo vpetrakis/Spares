@@ -3,23 +3,25 @@ import pandas as pd
 import openpyxl
 from datetime import datetime
 
-# --- PAGE CONFIGURATION ---
+# 1. PAGE CONFIGURATION (This MUST be the very first Streamlit command)
 st.set_page_config(
     page_title="Marine Spares & PMS Monitor", 
     page_icon="🚢", 
     layout="wide"
 )
 
-# --- CORE FUNCTIONS ---
-@st.cache_data
-def process_excel_with_hyperlinks(uploaded_file):
+# 2. CORE FUNCTIONS
+def process_excel_with_hyperlinks(file):
     """
     Reads the raw Excel file using openpyxl to bypass broken local links 
     and extract the raw hyperlink URLs containing component data.
     """
     try:
+        # Reset the file pointer (crucial for Streamlit Cloud to prevent read errors)
+        file.seek(0)
+        
         # Load the workbook (data_only=True ignores formulas)
-        wb = openpyxl.load_workbook(uploaded_file, data_only=True)
+        wb = openpyxl.load_workbook(file, data_only=True)
         
         # Locate the 'SPARES' sheet (case-insensitive check)
         sheet_name = next((s for s in wb.sheetnames if 'SPARES' in s.upper()), wb.sheetnames[0])
@@ -27,13 +29,13 @@ def process_excel_with_hyperlinks(uploaded_file):
         
         # Dynamically find the header row (looking for 'TA REF' or 'DESCRIPTION')
         header_row_idx = None
-        for i, row in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True)):
+        for i, row in enumerate(ws.iter_rows(min_row=1, max_row=15, values_only=True)):
             if row and ("TA REF" in row or "DESCRIPTION" in row):
                 header_row_idx = i + 1 # openpyxl uses 1-based indexing
                 break
                 
         if not header_row_idx:
-            st.error("Could not locate the header row. Please ensure columns like 'TA REF' exist.")
+            st.error("Could not locate the header row. Please ensure a column named 'TA REF' exists.")
             return pd.DataFrame()
 
         # Extract headers
@@ -52,26 +54,27 @@ def process_excel_with_hyperlinks(uploaded_file):
                     if cell.value is not None:
                         has_data = True
                     
-                    # EXTRACT HYPERLINK TARGETS (The critical step)
-                    if cell.hyperlink:
+                    # EXTRACT HYPERLINK TARGETS 
+                    if cell.hyperlink and cell.hyperlink.target:
                         row_data[f"{col_name}_URL"] = cell.hyperlink.target
                         
-            # Only append if the row has actual data (filters out empty trailing rows)
+            # Only append if the row has actual data
             if has_data and row_data.get("TA REF"):
                 data.append(row_data)
                 
         return pd.DataFrame(data)
+    
     except Exception as e:
-        st.error(f"Error processing file: {e}")
+        st.error(f"Error reading the Excel file: {str(e)}")
         return pd.DataFrame()
 
 def calculate_status(df):
     """
     Calculates the current status of each requisition based on PMS milestones.
     """
-    today = pd.to_datetime(datetime.today())
+    today = pd.to_datetime('today')
     
-    # Standardize date columns
+    # Standardize date columns safely
     date_cols = ['DATE', 'ORDER DATE', 'EST. READINESS', 'RCVD']
     for col in date_cols:
         if col in df.columns:
@@ -103,7 +106,7 @@ def calculate_status(df):
                 
         # 5. Fallback
         else:
-            statuses.append("⚪ Unknown")
+            statuses.append("⚪ Unknown Status")
             
     df['STATUS'] = statuses
     
@@ -115,9 +118,9 @@ def calculate_status(df):
         
     return df
 
-# --- UI LAYOUT ---
+# 3. UI LAYOUT
 st.title("🚢 Marine Spares & PMS Monitor")
-st.markdown("Upload your local copy of the **Excel (.xlsx)** file to extract hidden component links and track moving/lagging parts securely.")
+st.markdown("Upload your **Excel (.xlsx)** file to extract hidden component links and track moving/lagging parts securely.")
 
 # File Uploader
 uploaded_file = st.file_uploader("Upload Spares Excel File", type=["xlsx"])
@@ -161,10 +164,14 @@ if uploaded_file is not None:
             # Filters
             filter_cols = st.columns(2)
             with filter_cols[0]:
-                status_filter = st.multiselect("Filter by Status:", options=df['STATUS'].unique(), default=df['STATUS'].unique())
+                status_options = df['STATUS'].unique().tolist()
+                status_filter = st.multiselect("Filter by Status:", options=status_options, default=status_options)
             with filter_cols[1]:
                 if 'EQUIPMENT' in df.columns:
-                    equip_filter = st.multiselect("Filter by Equipment:", options=df['EQUIPMENT'].dropna().unique())
+                    equip_options = df['EQUIPMENT'].dropna().unique().tolist()
+                    equip_filter = st.multiselect("Filter by Equipment:", options=equip_options)
+                else:
+                    equip_filter = []
             
             # Apply Filters
             filtered_df = df[df['STATUS'].isin(status_filter)]
@@ -173,3 +180,5 @@ if uploaded_file is not None:
             
             # Show Data table
             st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+        else:
+            st.warning("No data found or sheet is empty. Please ensure the 'SPARES' sheet is formatted correctly.")

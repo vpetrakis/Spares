@@ -1,12 +1,29 @@
 """
-core/parser.py — Marine Spares Data Engine  v4
-Fixes vs v3:
-  - _norm_code: str(x).strip() — handles raw int/float from Pandas 3.x ArrowDtype
-  - Ghost row detection: only fires when ta_ref IS None (rows with ta_ref always kept)
-  - Hyperlink resolution: also checks cell VALUE for embedded path strings
-  - invoice / non-date columns: protected from to_datetime crash
-  - OF-26-2569 pattern: NR=None + SEQ=None + TA REF present → valid requisition
-  - Vessel name extracted from row 1 for multi-vessel support
+core/parser.py — Marine Spares Data Engine  v5
+Surgical fixes vs v4:
+
+ROW CLASSIFICATION (definitive):
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ Type          │ NR    │ SEQ   │ TA REF  │ Action                   │
+  │ Normal        │ any   │ any   │ present │ Full record              │
+  │ Continuation  │ None  │ None  │ present │ Record + inherit parent  │
+  │ Ghost/Split   │ None  │ None  │ absent  │ Merge into parent        │
+  │ Blank         │ –     │ –     │ –       │ Skip                     │
+  └─────────────────────────────────────────────────────────────────────┘
+
+CONTINUATION ROW (OF-26-2569 pattern in STEFANOS):
+  - Has its own TA REF but no NR / SEQ
+  - Inherits case_code + account_code from immediately preceding record
+  - Keeps its own data (description, supplier, dates, cost, hyperlink)
+
+GHOST/SPLIT ROW:
+  - No TA REF, no NR, no SEQ — but has supplier/order_date/cost
+  - Merged into previous record as sub_order
+  - Cost NOT merged if parent is cancelled
+
+_norm_code: accepts any Python type (int/float/str/None) — no .strip() on raw value
+
+invoice: coerced with format='mixed' to handle '60 DAYS' strings silently
 """
 from __future__ import annotations
 
@@ -52,16 +69,19 @@ SLA: dict[str, int] = {
 _HYPERLINK_BASE = r"Z:\Marine_Dept\Alexis\Spares\Hyperlinks 2026"
 
 _PRIORITY_COLS = [
-    "vessel", "status_label", "flag", "ta_ref", "case_code", "description",
-    "equipment", "category_name", "date_requested", "supplier", "order_date",
+    "vessel", "status_label", "flag",
+    "ta_ref", "nr", "seq", "case_code", "description", "equipment",
+    "category_name", "date_requested", "supplier", "order_date",
     "cost", "cost_raw", "is_cancelled",
-    "est_readiness", "port", "rcvd", "account_code", "message", "confirmation",
-    "awb", "invoice", "document_url", "status", "sla_breach", "sla_days_over",
-    "days_in_stage", "sub_orders",
+    "est_readiness", "port", "rcvd", "account_code", "message",
+    "confirmation", "awb", "invoice", "document_url",
+    "status", "sla_breach", "sla_days_over", "days_in_stage", "sub_orders",
 ]
 
-# Regex for embedded path strings in cell values
-_PATH_RE = re.compile(r"(\.\.[\\/].*\.(?:doc|pdf|xls|xlsx|docx))", re.IGNORECASE)
+# Regex: embedded relative path in cell value
+_PATH_RE = re.compile(
+    r"(\.\.[\\/][^\s\x00]+\.(?:doc|pdf|xls|xlsx|docx))", re.IGNORECASE
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -69,8 +89,7 @@ _PATH_RE = re.compile(r"(\.\.[\\/].*\.(?:doc|pdf|xls|xlsx|docx))", re.IGNORECASE
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _resolve_hyperlink(raw: str) -> str:
-    """Convert relative UNC / encoded path to file:/// URL."""
-    decoded = urllib.parse.unquote(raw)
+    decoded = urllib.parse.unquote(str(raw))
     m = re.search(r"MODION(.+)$", decoded, re.IGNORECASE)
     if m:
         tail = m.group(1).replace("\\", "/")
@@ -80,21 +99,20 @@ def _resolve_hyperlink(raw: str) -> str:
 
 
 def _extract_path_from_value(val: object) -> Optional[str]:
-    """If a cell VALUE contains an embedded path string, extract it."""
+    """Extract embedded path string from a cell value (fallback for cells
+    where hyperlink target is missing but value IS the path)."""
     if val is None:
         return None
-    s = str(val)
-    m = _PATH_RE.search(s)
+    m = _PATH_RE.search(str(val))
     return _resolve_hyperlink(m.group(1)) if m else None
 
 
 def _ts(val) -> Optional[pd.Timestamp]:
-    """Safely coerce any value to Timestamp; returns None for NaT/None/bad."""
     if val is None:
         return None
     try:
-        result = pd.Timestamp(val)
-        return None if pd.isnull(result) else result
+        r = pd.Timestamp(val)
+        return None if pd.isnull(r) else r
     except Exception:
         return None
 
@@ -105,9 +123,8 @@ def _is_cancelled(confirmation: object) -> bool:
 
 def _norm_code(x: object) -> str:
     """
-    Normalise account_code to string.
-    Handles: int (5513), float (5513.0), str ('5513'), str ('5517C'), None/NaN.
-    IMPORTANT: accepts any type — does NOT assume str input (Pandas 3.x ArrowDtype).
+    Normalise any account_code value to a clean string key.
+    Accepts int (5513), float (5513.0), str ('5517C'), None — no type assumption.
     """
     if x is None:
         return ""
@@ -115,13 +132,19 @@ def _norm_code(x: object) -> str:
     if s in ("", "None", "nan", "NaN", "<NA>"):
         return ""
     try:
-        # Pure-integer codes: 5513.0 → "5513"
         f = float(s)
         if f == int(f):
             return str(int(f))
         return s
     except (ValueError, OverflowError):
         return s
+
+
+def _doc_url(cell_hl_target: Optional[str], cell_value: object) -> Optional[str]:
+    """Resolve document URL from hyperlink target OR embedded path in value."""
+    if cell_hl_target:
+        return _resolve_hyperlink(str(cell_hl_target))
+    return _extract_path_from_value(cell_value)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -137,7 +160,8 @@ def _compute_state(row: dict, now: pd.Timestamp) -> dict:
 
     if "CANCEL" in confirm:
         return dict(status="CANCELLED", status_label="✖ Cancelled",
-                    flag="CANCELLED", days_in_stage=None, sla_breach=False, sla_days_over=0)
+                    flag="CANCELLED", days_in_stage=None,
+                    sla_breach=False, sla_days_over=0)
 
     if rcvd is not None:
         return dict(status="RECEIVED", status_label="🟢 Received",
@@ -148,40 +172,41 @@ def _compute_state(row: dict, now: pd.Timestamp) -> dict:
         overdue = int((now - est_ready).days)
         breach  = overdue > 0
         return dict(
-            status="OVERDUE_TRANSIT" if breach else "IN_TRANSIT",
-            status_label="🔴 Transit Overdue" if breach else "🟡 In Transit",
-            flag="DELAYED" if breach else "OK",
-            days_in_stage=abs(overdue),
-            sla_breach=breach,
-            sla_days_over=overdue if breach else 0,
+            status        = "OVERDUE_TRANSIT" if breach else "IN_TRANSIT",
+            status_label  = "🔴 Transit Overdue" if breach else "🟡 In Transit",
+            flag          = "DELAYED" if breach else "OK",
+            days_in_stage = abs(overdue),
+            sla_breach    = breach,
+            sla_days_over = overdue if breach else 0,
         )
 
     if order_date is not None:
         days  = int((now - order_date).days)
         breach = days > SLA["ordered"]
         return dict(
-            status="OVERDUE_ORDERED" if breach else "ORDERED",
-            status_label="🔴 Order Overdue" if breach else "🟠 Ordered",
-            flag="DELAYED" if breach else "OK",
-            days_in_stage=days,
-            sla_breach=breach,
-            sla_days_over=max(0, days - SLA["ordered"]),
+            status        = "OVERDUE_ORDERED" if breach else "ORDERED",
+            status_label  = "🔴 Order Overdue" if breach else "🟠 Ordered",
+            flag          = "DELAYED" if breach else "OK",
+            days_in_stage = days,
+            sla_breach    = breach,
+            sla_days_over = max(0, days - SLA["ordered"]),
         )
 
     if date_req is not None:
         days  = int((now - date_req).days)
         breach = days > SLA["supply"]
         return dict(
-            status="OVERDUE_SUPPLY" if breach else "PENDING_SUPPLY",
-            status_label="🔴 Supply Overdue" if breach else "🔵 Pending Supply",
-            flag="DELAYED" if breach else "OK",
-            days_in_stage=days,
-            sla_breach=breach,
-            sla_days_over=max(0, days - SLA["supply"]),
+            status        = "OVERDUE_SUPPLY" if breach else "PENDING_SUPPLY",
+            status_label  = "🔴 Supply Overdue" if breach else "🔵 Pending Supply",
+            flag          = "DELAYED" if breach else "OK",
+            days_in_stage = days,
+            sla_breach    = breach,
+            sla_days_over = max(0, days - SLA["supply"]),
         )
 
     return dict(status="UNKNOWN", status_label="⚪ Unknown",
-                flag="ERROR", days_in_stage=None, sla_breach=False, sla_days_over=0)
+                flag="ERROR", days_in_stage=None,
+                sla_breach=False, sla_days_over=0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -209,19 +234,51 @@ def _parse_index(ws) -> dict[str, dict]:
     return result
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# VESSEL NAME EXTRACTOR
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _extract_vessel(ws) -> str:
-    """Read vessel name from row 1, col A (e.g. 'M/V ALEXIS - SPARE CASES 2026')."""
     cell = ws.cell(row=1, column=1).value
     if not cell:
         return ""
     s = str(cell)
-    # Pattern: "M/V <NAME> - SPARE..." → extract <NAME>
     m = re.match(r"M/V\s+(.+?)\s*[-–]", s, re.IGNORECASE)
     return m.group(1).strip().title() if m else s.strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ROW CLASSIFIER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _classify_row(raw: dict) -> str:
+    """
+    Returns: 'normal' | 'continuation' | 'ghost' | 'blank'
+
+    normal:       ta_ref present                          → full record
+    continuation: ta_ref present, nr=None, seq=None       → record + inherit parent
+    ghost:        ta_ref absent + has supplier/date/cost   → merge into parent
+    blank:        nothing at all                           → skip
+    """
+    ta_ref = raw.get("ta_ref")
+    nr     = raw.get("nr")
+    seq    = raw.get("seq")
+    has_payload = (raw.get("supplier") is not None
+                   or raw.get("order_date") is not None
+                   or raw.get("cost") is not None)
+
+    data_vals = [v for k, v in raw.items()
+                 if not k.startswith("__hl_") and v is not None]
+
+    if not data_vals:
+        return "blank"
+
+    if ta_ref is not None:
+        # Has a TA REF → always a real requisition
+        if nr is None and seq is None:
+            return "continuation"   # e.g. OF-26-2569 in STEFANOS
+        return "normal"
+
+    # No TA REF
+    if has_payload:
+        return "ghost"              # e.g. OCEANTECH sub-order row
+    return "blank"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -230,21 +287,21 @@ def _extract_vessel(ws) -> str:
 
 def parse_workbook(file_bytes: bytes) -> tuple[pd.DataFrame, dict, list[str]]:
     """
-    Parse any Marine Spares workbook (ALEXIS, STEFANOS T, MINOAN SEA, …).
+    Parse any Marine Spares workbook.
 
-    Guarantees:
-      - Cancelled rows → cost=NaN, cost_raw=original  (budget safe)
-      - Ghost rows (split orders, NR/SEQ=None but TA REF present) → kept as records
-      - account_code normalised from any type (int/float/str) without crash
-      - Embedded path strings in MESSAGE cell values resolved as document_url
-      - Non-date 'invoice' strings (e.g. '60 DAYS') silently ignored
+    Row classification:
+      normal       → full record (NR/SEQ/TA REF all present)
+      continuation → TA REF present, NR+SEQ absent; inherits case_code + account_code
+                     from preceding record; retains its own data (dates, costs, etc.)
+      ghost/split  → TA REF absent; merged into preceding record as sub_order
+      blank        → skipped
 
-    Returns:
-        df          — one row per requisition
-        index_kpis  — category KPI dict from INDEX sheet
-        warnings    — non-fatal data quality messages
+    Financial guarantee:
+      Cancelled rows: cost set to NaN (excluded from all sums)
+                      cost_raw preserved for audit
+      Ghost cost: only merged if parent is NOT cancelled
     """
-    warnings: list[str] = []
+    warnings_out: list[str] = []
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
 
     spares_name = next((s for s in wb.sheetnames if "SPARES" in s.upper()), None)
@@ -256,7 +313,7 @@ def parse_workbook(file_bytes: bytes) -> tuple[pd.DataFrame, dict, list[str]]:
     index_kpis = _parse_index(wb[index_name]) if index_name else {}
     vessel     = _extract_vessel(ws)
 
-    # ── Locate header row ─────────────────────────────────────────────────────
+    # ── Find header row ───────────────────────────────────────────────────────
     header_row = None
     for i, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True)):
         if row and "TA REF" in row:
@@ -269,9 +326,10 @@ def parse_workbook(file_bytes: bytes) -> tuple[pd.DataFrame, dict, list[str]]:
     for i, cell in enumerate(ws[header_row]):
         if cell.value is not None:
             raw_h = str(cell.value)
-            col_idx[i] = COL_MAP.get(raw_h, raw_h.lower().replace(" ", "_").strip())
+            col_idx[i] = COL_MAP.get(raw_h,
+                                     raw_h.lower().replace(" ", "_").strip())
 
-    # ── Read data rows ─────────────────────────────────────────────────────────
+    # ── Read and classify rows ────────────────────────────────────────────────
     records: list[dict] = []
 
     for row in ws.iter_rows(min_row=header_row + 1):
@@ -280,17 +338,17 @@ def parse_workbook(file_bytes: bytes) -> tuple[pd.DataFrame, dict, list[str]]:
             if i not in col_idx:
                 continue
             raw[col_idx[i]] = cell.value
-            # Capture hyperlink object target
             if cell.hyperlink and cell.hyperlink.target:
                 raw[f"__hl_{col_idx[i]}"] = cell.hyperlink.target
 
-        ta_ref = raw.get("ta_ref")
-        seq    = raw.get("seq")
+        kind = _classify_row(raw)
 
-        # ── Ghost row: ONLY when ta_ref is truly absent ────────────────────
-        # Rows with ta_ref present (even if NR/SEQ missing) are valid requisitions.
-        if (ta_ref is None and seq is None
-                and (raw.get("supplier") or raw.get("order_date") or raw.get("cost"))):
+        # ── BLANK ─────────────────────────────────────────────────────────────
+        if kind == "blank":
+            continue
+
+        # ── GHOST / SPLIT ORDER ───────────────────────────────────────────────
+        if kind == "ghost":
             if records:
                 parent   = records[-1]
                 sub_cost = raw.get("cost")
@@ -299,41 +357,45 @@ def parse_workbook(file_bytes: bytes) -> tuple[pd.DataFrame, dict, list[str]]:
                     "order_date": raw.get("order_date"),
                     "cost":       sub_cost,
                 })
+                # Accumulate cost only if parent is NOT cancelled
                 if sub_cost is not None and not parent.get("_cancelled_flag", False):
                     parent["cost"] = (parent.get("cost") or 0.0) + float(sub_cost)
-                warnings.append(
+                warnings_out.append(
                     f"Split order merged → {parent.get('ta_ref','?')} "
-                    f"(supplier: {raw.get('supplier')}, cost: {sub_cost})"
+                    f"(supplier: {raw.get('supplier')}, "
+                    f"cost: {sub_cost})"
                 )
             else:
-                warnings.append(f"Orphan ghost row ignored: {raw}")
+                warnings_out.append(f"Orphan ghost row ignored: {raw}")
             continue
 
-        # Skip fully blank rows
-        data_vals = [v for k, v in raw.items() if not k.startswith("__hl_")]
-        if not any(v is not None for v in data_vals):
-            continue
+        # ── CONTINUATION ROW (TA REF present, NR+SEQ absent) ─────────────────
+        if kind == "continuation":
+            # Inherit case_code + account_code from the most recent record
+            # (they share the same requisition group / vessel area)
+            if records:
+                parent_rec = records[-1]
+                if not raw.get("case_code"):
+                    raw["case_code"]    = parent_rec.get("case_code")
+                if not raw.get("account_code"):
+                    raw["account_code"] = parent_rec.get("account_code")
+            warnings_out.append(
+                f"Continuation row kept: {raw.get('ta_ref')} "
+                f"(NR/SEQ absent, inherited case/code from preceding record)"
+            )
+            # falls through to normal record processing below
 
-        # Rows without ta_ref that are not ghost rows → skip with warning
-        if ta_ref is None:
-            warnings.append(f"Row without TA REF skipped (seq={seq}, nr={raw.get('nr')})")
-            continue
+        # ── NORMAL / CONTINUATION — build record ──────────────────────────────
+        # Document URL: hyperlink object on MESSAGE takes priority;
+        # fall back to embedded path string in MESSAGE cell value
+        msg_hl  = raw.pop("__hl_message", None)
+        msg_val = raw.get("message")
+        raw["document_url"] = _doc_url(msg_hl, msg_val)
 
-        # ── Document URL resolution ────────────────────────────────────────
-        # Priority 1: hyperlink object on MESSAGE cell
-        # Priority 2: embedded path string in MESSAGE cell value
-        hl_obj = raw.pop("__hl_message", None)
-        if hl_obj:
-            raw["document_url"] = _resolve_hyperlink(str(hl_obj))
-        else:
-            embedded = _extract_path_from_value(raw.get("message"))
-            raw["document_url"] = embedded  # None if no path found
-
-        # Remove all other __hl_ keys
+        # Remove remaining __hl_ keys
         for k in [k for k in list(raw) if k.startswith("__hl_")]:
             raw.pop(k)
 
-        # ── Cancelled detection ────────────────────────────────────────────
         raw["_cancelled_flag"] = _is_cancelled(raw.get("confirmation"))
         raw["vessel"]          = vessel
         raw.setdefault("sub_orders", [])
@@ -344,49 +406,51 @@ def parse_workbook(file_bytes: bytes) -> tuple[pd.DataFrame, dict, list[str]]:
 
     df = pd.DataFrame(records)
 
-    # ── Date coercion (protected) ──────────────────────────────────────────
-    # 'invoice' may contain strings like '60 DAYS' — coerce with errors='coerce'
-    for col in ["date_requested", "order_date", "est_readiness", "rcvd", "ref_date", "invoice"]:
+    # ── Date coercion ──────────────────────────────────────────────────────────
+    # format='mixed' silently handles text like '60 DAYS', 'ARRIVING ...' → NaT
+    for col in ["date_requested", "order_date", "est_readiness",
+                "rcvd", "ref_date", "invoice"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce", format="mixed")
 
-    # ── Numeric coercion ───────────────────────────────────────────────────
+    # ── Numeric coercion ───────────────────────────────────────────────────────
     for col in ["cost", "seq", "nr"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # ── String coercion ────────────────────────────────────────────────────
+    # ── String coercion ────────────────────────────────────────────────────────
     str_cols = ["ta_ref", "case_code", "equipment", "description", "message",
                 "supplier", "confirmation", "port", "awb", "vessel"]
     for col in str_cols:
         if col in df.columns:
-            df[col] = (df[col].astype(str).str.strip()
-                       .replace({"None": "", "nan": "", "NaN": ""}))
+            df[col] = (df[col].astype(str)
+                               .str.strip()
+                               .replace({"None": "", "nan": "", "NaN": ""}))
 
-    # ── account_code normalisation ─────────────────────────────────────────
-    # _norm_code accepts any type — no astype(str) prerequisite needed
+    # ── account_code normalisation ─────────────────────────────────────────────
+    # _norm_code accepts any type — no astype(str) needed first
     if "account_code" in df.columns:
         df["account_code"] = df["account_code"].apply(_norm_code)
     else:
         df["account_code"] = ""
 
-    # ── Cancelled cost isolation ───────────────────────────────────────────
+    # ── Cancelled cost isolation ───────────────────────────────────────────────
     df["is_cancelled"] = df["_cancelled_flag"].fillna(False).astype(bool)
     df["cost_raw"]     = pd.to_numeric(df.get("cost"), errors="coerce").copy()
     df.loc[df["is_cancelled"], "cost"] = float("nan")
     df = df.drop(columns=["_cancelled_flag"])
 
-    # ── Category enrichment ───────────────────────────────────────────────
+    # ── Category enrichment from INDEX ────────────────────────────────────────
     df["category_name"] = df["account_code"].apply(
         lambda c: index_kpis.get(c, {}).get("category_name", "")
     )
 
-    # ── State machine ─────────────────────────────────────────────────────
+    # ── State machine ──────────────────────────────────────────────────────────
     now    = pd.Timestamp(datetime.now())
     states = [_compute_state(r, now) for r in df.to_dict("records")]
     df     = pd.concat([df, pd.DataFrame(states)], axis=1)
 
-    # ── Final column order ────────────────────────────────────────────────
+    # ── Column ordering ────────────────────────────────────────────────────────
     ordered = [c for c in _PRIORITY_COLS if c in df.columns]
     rest    = [c for c in df.columns    if c not in ordered]
-    return df[ordered + rest], index_kpis, warnings
+    return df[ordered + rest], index_kpis, warnings_out
